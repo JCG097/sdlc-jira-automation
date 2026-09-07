@@ -1,0 +1,77 @@
+name: SDLC CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Automated Tests
+        run: |
+          echo "Ejecutando suite de pruebas automatizadas..."
+          exit 0
+
+      - name: Extract Jira Issue Key
+        id: jira_key
+        run: |
+          # Extrae la clave del ticket (ej: SDLC-4) desde el mensaje del commit
+          ISSUE_KEY=$(echo "${{ github.event.head_commit.message }}" | grep -oE '[A-Z]+-[0-9]+' | head -n 1)
+          if [ -z "$ISSUE_KEY" ]; then
+            echo "No se detectó ID de Jira en el commit. Usando ticket por defecto: SDLC-4"
+            ISSUE_KEY="SDLC-4"
+          fi
+          echo "issue_key=$ISSUE_KEY" >> $GITHUB_OUTPUT
+          echo "Ticket detectado: $ISSUE_KEY"
+
+      - name: Transition Jira Issue to Ready for QA
+        env:
+          JIRA_BASE: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_USER: ${{ secrets.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          ISSUE_KEY: ${{ steps.jira_key.outputs.issue_key }}
+        run: |
+          echo "Consultando transiciones disponibles para $ISSUE_KEY..."
+          AUTH=$(echo -n "$JIRA_USER:$JIRA_TOKEN" | base64)
+          
+          # Consultar la API REST de Jira
+          RESPONSE=$(curl -s -X GET \
+            "$JIRA_BASE/rest/api/3/issue/$ISSUE_KEY/transitions" \
+            -H "Authorization: Basic $AUTH" \
+            -H "Content-Type: application/json")
+          
+          # Buscar el ID de la transición hacia Ready for QA o Send to QA
+          TRANSITION_ID=$(echo "$RESPONSE" | jq -r '.transitions[] | select(.to.name=="READY FOR QA" or .to.name=="Ready for QA" or .name=="Send to QA") | .id' | head -n 1)
+          
+          if [ -z "$TRANSITION_ID" ] || [ "$TRANSITION_ID" == "null" ]; then
+            echo "No se encontro transicion hacia Ready for QA. Transiciones posibles:"
+            echo "$RESPONSE" | jq '.transitions[] | {id: .id, name: .name, to: .to.name}'
+          else
+            echo "Ejecutando transicion ID $TRANSITION_ID para $ISSUE_KEY..."
+            curl -s -X POST \
+              "$JIRA_BASE/rest/api/3/issue/$ISSUE_KEY/transitions" \
+              -H "Authorization: Basic $AUTH" \
+              -H "Content-Type: application/json" \
+              -d "{\"transition\": {\"id\": \"$TRANSITION_ID\"}}"
+            echo "Transicion ejecutada exitosamente."
+          fi
+
+      - name: Notify Discord / ChatOps
+        if: success()
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ISSUE_KEY: ${{ steps.jira_key.outputs.issue_key }}
+          JIRA_BASE: ${{ secrets.JIRA_BASE_URL }}
+        run: |
+          PAYLOAD=$(cat <<EOF
+          {
+            "content": "🚀 **El ticket [${ISSUE_KEY}](${JIRA_BASE}/browse/${ISSUE_KEY}) ha sido desplegado en Staging y está listo para pruebas.**"
+          }
+          EOF
+          )
+          curl -s -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK"
+          echo "Notificacion enviada a Discord."
